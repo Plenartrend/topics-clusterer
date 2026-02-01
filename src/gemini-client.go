@@ -24,10 +24,10 @@ Vorgaben:
 - Keine neuen Inhalte oder politischen Konzepte einführen, die nicht in den Titeln angelegt sind.
 `
 
-func getClusterTitle(topicDistances []TopicDistance, logger *Logger) (string, error) {
+func getClusterTitle(topicDistances []DataPointDistance, logger *Logger) (string, error) {
 	var closestTopicsString string
 	for _, td := range topicDistances {
-		closestTopicsString = closestTopicsString + fmt.Sprintf("- %v (%.4f)\n", td.obs.TopicName, td.distance)
+		closestTopicsString = closestTopicsString + fmt.Sprintf("- %v (%.4f)\n", td.DataPoint.(TopicDataPoint).TopicName, td.Distance)
 	}
 
 	logger.Debug(closestTopicsString)

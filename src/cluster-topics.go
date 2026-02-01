@@ -3,12 +3,11 @@ package main
 import (
 	"fmt"
 	"math"
+	"math/rand"
 	"sort"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
-	"github.com/muesli/clusters"
-	"github.com/muesli/kmeans"
 	"github.com/pgvector/pgvector-go"
 )
 
@@ -18,67 +17,48 @@ type Topic struct {
 	Embedding pgvector.Vector `db:"embedding" json:"embedding,omitempty"`
 }
 
-type TopicObservation struct {
+type TopicDataPoint struct {
 	TopicID   int
 	TopicName string
-	Coords    []float32
+	coords    Coordinates
 }
 
-type TopicDistance struct {
-	obs      TopicObservation
-	distance float64
+func (tdp TopicDataPoint) Coordinates() Coordinates {
+	return tdp.coords
 }
 
-func (t TopicObservation) Coordinates() clusters.Coordinates {
-	coords := make(clusters.Coordinates, len(t.Coords))
-	for i, v := range t.Coords {
+func toCoordinates(coordinates []float32) Coordinates {
+	coords := make(Coordinates, len(coordinates))
+	for i, v := range coordinates {
 		coords[i] = float64(v)
 	}
 	return coords
 }
 
-func (t TopicObservation) Distance(point clusters.Coordinates) float64 {
-	var sum float64
-	coords := t.Coordinates()
-	for i, v := range coords {
-		diff := v - point[i]
-		sum += diff * diff
-	}
-	return math.Sqrt(sum)
-}
-
-func doClustering(topics []Topic, numClusters int) (clusters.Clusters, error) {
-	observations := make(clusters.Observations, len(topics))
+func doClustering(topics []Topic, numClusters int) ([]Cluster, error) {
+	topicDataPoints := make([]DataPoint, len(topics))
 	for i, topic := range topics {
-		observations[i] = TopicObservation{
+		topicDataPoints[i] = TopicDataPoint{
 			TopicID:   topic.ID,
 			TopicName: topic.Name,
-			Coords:    topic.Embedding.Slice(),
+			coords:    toCoordinates(topic.Embedding.Slice()),
 		}
 	}
 
-	clusterer, err := kmeans.NewWithOptions(0.01, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create clusterer: %w", err)
-	}
-
-	clusters, err := clusterer.Partition(observations, numClusters)
-	if err != nil {
-		return nil, fmt.Errorf("failed to partition: %w", err)
-	}
+	centroids := kmeanspp(numClusters, topicDataPoints, rand.New(rand.NewSource(42)))
+	clusters := kmeans_deterministic(numClusters, topicDataPoints, centroids, 200, rand.New(rand.NewSource(42)))
 
 	return clusters, nil
 }
 
-func getClosestTopics(cluster clusters.Cluster, n int) []TopicDistance {
-	distances := make([]TopicDistance, len(cluster.Observations))
-	for j, obs := range cluster.Observations {
-		topicObs := obs.(TopicObservation)
-		distances[j] = TopicDistance{obs: topicObs, distance: topicObs.Distance(cluster.Center)}
+func getClosestTopics(cluster Cluster, n int) []DataPointDistance {
+	distances := make([]DataPointDistance, len(cluster.Points))
+	for j, dataPoint := range cluster.Points {
+		distances[j] = DataPointDistance{DataPoint: dataPoint, Distance: distance(dataPoint.Coordinates(), cluster.Centroid)}
 	}
 
 	sort.Slice(distances, func(i int, j int) bool {
-		return distances[i].distance < distances[j].distance
+		return distances[i].Distance < distances[j].Distance
 	})
 
 	return distances[:int(math.Min(float64(n), float64(len(distances))))]
@@ -119,7 +99,7 @@ func clusterTopics(num_clusters int, num_closest_topics int, db *sqlx.DB, logger
 	}
 
 	for i, cluster := range resultClusters {
-		logger.Debug(fmt.Sprintf("=== Cluster %d (contains %d topics) ===", i, len(cluster.Observations)))
+		logger.Debug(fmt.Sprintf("=== Cluster %d (contains %d topics) ===", i, len(cluster.Points)))
 
 		closestTopics := getClosestTopics(cluster, num_closest_topics)
 
@@ -139,9 +119,9 @@ func clusterTopics(num_clusters int, num_closest_topics int, db *sqlx.DB, logger
 		}
 
 		var clusterTopicIds []int
-		for _, obs := range cluster.Observations {
-			topicObs := obs.(TopicObservation)
-			clusterTopicIds = append(clusterTopicIds, topicObs.TopicID)
+		for _, dataPoint := range cluster.Points {
+			topicDataPoint := dataPoint.(TopicDataPoint)
+			clusterTopicIds = append(clusterTopicIds, topicDataPoint.TopicID)
 		}
 
 		logger.Debug(fmt.Sprintf("Assigning %d topics to cluster ID %d", len(clusterTopicIds), clusterId))
