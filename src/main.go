@@ -37,6 +37,8 @@ Vorgaben:
 - Keine neuen Inhalte oder politischen Konzepte einführen, die nicht in den Titeln angelegt sind.
 `
 
+var serviceLogPrefix = "TopicClusterer"
+
 type Topic struct {
 	ID        int             `db:"id" json:"id,omitempty"`
 	Name      string          `db:"name" json:"name,omitempty"`
@@ -195,75 +197,101 @@ func getClusterTitle(topicDistances []TopicDistance) (string, error) {
 func main() {
 	_ = godotenv.Load()
 
-	NUM_CLUSTERS, err := strconv.Atoi(os.Getenv("NUM_CLUSTERS"))
+	LOG_LEVEL, err := GetLogLevel(os.Getenv("LOG_LEVEL"))
 	if err != nil {
-		log.Fatal("NUM_CLUSTERS is required and must be an integer")
-	}
-
-	NUM_CLOSEST_TOPICS, err := strconv.Atoi(os.Getenv("NUM_CLOSEST_TOPICS"))
-	if err != nil {
-		log.Fatal("NUM_CLOSEST_TOPICS is required and must be an integer")
+		log.Fatalf("Invalid LOG_LEVEL: %v", err)
 	}
 
 	dbURL := buildDatabaseURL()
 
 	var db *sqlx.DB
+	attempt := 0
 	for true {
+		attempt++
 		db, err = sqlx.Connect("postgres", dbURL)
 		if err == nil {
 			defer db.Close()
 			break
 		}
-		log.Printf("Failed to connect to database: %v", err)
+
+		log.Printf(
+			"Failed to connect to database (attempt=%d host=%q port=%q db=%q sslmode=%q): %v",
+			attempt,
+			os.Getenv("DATABASE_HOST"),
+			os.Getenv("DATABASE_PORT"),
+			os.Getenv("DATABASE_NAME"),
+			os.Getenv("DATABASE_SSLMODE"),
+			err,
+		)
 		time.Sleep(time.Second)
+	}
+
+	logger := NewLogger(db, &LOG_LEVEL, &LOG_LEVEL, serviceLogPrefix)
+
+	NUM_CLUSTERS, err := strconv.Atoi(os.Getenv("NUM_CLUSTERS"))
+	if err != nil {
+		logger.Error("NUM_CLUSTERS is required and must be an integer")
+		return
+	}
+
+	NUM_CLOSEST_TOPICS, err := strconv.Atoi(os.Getenv("NUM_CLOSEST_TOPICS"))
+	if err != nil {
+		logger.Error("NUM_CLOSEST_TOPICS is required and must be an integer")
+		return
 	}
 
 	tx, err := db.Beginx()
 	if err != nil {
-		log.Fatalf("Failed to begin transaction: %v", err)
+		logger.Error(fmt.Sprintf("Failed to begin transaction: %v", err))
+		return
 	}
 	defer tx.Rollback()
 
 	_, err = tx.Exec("DELETE FROM topic_clusters")
 	if err != nil {
-		log.Fatalf("Failed to clear topic_clusters table: %v", err)
+		logger.Error(fmt.Sprintf("Failed to clear topic_clusters table: %v", err))
+		return
 	}
 
 	_, err = tx.Exec("ALTER SEQUENCE topic_clusters_id_seq RESTART WITH 1")
 	if err != nil {
-		log.Fatalf("Failed to reset topic_clusters sequence: %v", err)
+		logger.Error(fmt.Sprintf("Failed to reset topic_clusters sequence: %v", err))
+		return
 	}
 
 	var topics []Topic
 	err = tx.Select(&topics, "SELECT id, name, embedding FROM topics")
 	if err != nil {
-		log.Fatalf("Failed to fetch topics: %v", err)
+		logger.Error(fmt.Sprintf("Failed to fetch topics: %v", err))
+		return
 	}
 
-	fmt.Printf("Fetched %d topics from database\n", len(topics))
+	logger.Debug(fmt.Sprintf("Fetched %d topics from database\n", len(topics)))
 
 	resultClusters, err := clusterTopics(topics, NUM_CLUSTERS)
 	if err != nil {
-		log.Fatalf("Clustering failed: %v", err)
+		logger.Error(fmt.Sprintf("Clustering failed: %v", err))
+		return
 	}
 
 	for i, cluster := range resultClusters {
-		fmt.Printf("\n=== Cluster %d (contains %d topics) ===\n", i, len(cluster.Observations))
+		logger.Debug(fmt.Sprintf("\n=== Cluster %d (contains %d topics) ===\n", i, len(cluster.Observations)))
 
 		closestTopics := getClosestTopics(cluster, NUM_CLOSEST_TOPICS)
 
 		title, err := getClusterTitle(closestTopics)
 		if err != nil {
-			log.Printf("Failed to get cluster title: %v", err)
-			continue
+			logger.Error(fmt.Sprintf("Failed to get cluster title: %v", err))
+			return
 		}
 
-		fmt.Printf("Cluster Title: %s\n", title)
+		logger.Info(fmt.Sprintf("Cluster Title: %s", title))
 
 		var clusterId int
 		err = tx.Get(&clusterId, "INSERT INTO topic_clusters (title) VALUES ($1) RETURNING id", title)
 		if err != nil {
-			log.Fatalf("Failed to insert topic cluster: %v", err)
+			logger.Error(fmt.Sprintf("Failed to insert topic cluster: %v", err))
+			return
 		}
 
 		var clusterTopicIds []int
@@ -274,14 +302,17 @@ func main() {
 
 		_, err = tx.Exec("UPDATE topics SET cluster_id = $1 WHERE id = ANY($2)", clusterId, pq.Array(clusterTopicIds))
 		if err != nil {
-			log.Fatalf("Failed to update topics with cluster ID: %v", err)
+			logger.Error(fmt.Sprintf("Failed to update topics with cluster ID: %v", err))
+			return
 		}
 
-		fmt.Printf("Assigned %d topics to cluster ID %d\n", len(clusterTopicIds), clusterId)
+		logger.Info(fmt.Sprintf("Assigned %d topics to cluster ID %d", len(clusterTopicIds), clusterId))
 	}
 
 	err = tx.Commit()
 	if err != nil {
-		log.Fatalf("Failed to commit transaction: %v", err)
+		logger.Error(fmt.Sprintf("Failed to commit transaction: %v", err))
 	}
+
+	logger.Info("Topic clustering completed successfully.")
 }
