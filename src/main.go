@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
+var topicsClustererRunning bool = false
 var serviceLogPrefix = "TopicClusterer"
 
 func buildDatabaseURL() string {
@@ -73,6 +75,29 @@ func tryAcquireTopicClusterLock(db *sqlx.DB, logger *Logger) (bool, error) {
 	}
 
 	return true, nil
+}
+
+func topicClustererWorker(NUM_CLUSTERS int, NUM_CLOSEST_TOPICS int, TOPIC_CLUSTERING_SLEEP_HOURS int, db *sqlx.DB, logger *Logger) {
+	for {
+		for !topicsClustererRunning {
+			logger.Info("Topic clustering is currently paused. Sleeping for 10 seconds.")
+			time.Sleep(10 * time.Second)
+		}
+
+		logger.Info("Starting topic clustering run")
+
+		err := clusterTopics(NUM_CLUSTERS, NUM_CLOSEST_TOPICS, db, logger)
+
+		if err == nil {
+			logger.Info("Topic clustering run completed successfully.")
+			logger.Info(fmt.Sprintf("Sleeping for %d hours before next run.", TOPIC_CLUSTERING_SLEEP_HOURS))
+			time.Sleep(time.Duration(TOPIC_CLUSTERING_SLEEP_HOURS) * time.Hour)
+		} else {
+			logger.Error(fmt.Sprintf("Failed to cluster topics: %v", err))
+			logger.Info("Sleeping for 60 minutes before next attempt.")
+			time.Sleep(60 * time.Minute)
+		}
+	}
 }
 
 func heartbeatWorker(db *sqlx.DB, logger *Logger) {
@@ -140,6 +165,12 @@ func main() {
 		return
 	}
 
+	topicsClustererRunning, err = strconv.ParseBool(os.Getenv("BEGIN_CLUSTERING_ON_STARTUP"))
+	if err != nil {
+		logger.Error("BEGIN_CLUSTERING_ON_STARTUP is required and must be a boolean")
+		return
+	}
+
 	for {
 		acquired, err := tryAcquireTopicClusterLock(db, logger)
 		if err != nil {
@@ -157,17 +188,21 @@ func main() {
 
 	go heartbeatWorker(db, logger)
 
-	for {
-		err = clusterTopics(NUM_CLUSTERS, NUM_CLOSEST_TOPICS, db, logger)
+	go topicClustererWorker(NUM_CLUSTERS, NUM_CLOSEST_TOPICS, TOPIC_CLUSTERING_SLEEP_HOURS, db, logger)
 
-		if err == nil {
-			logger.Info("Topic clustering run completed successfully.")
-			logger.Info(fmt.Sprintf("Sleeping for %d hours before next run.", TOPIC_CLUSTERING_SLEEP_HOURS))
-			time.Sleep(time.Duration(TOPIC_CLUSTERING_SLEEP_HOURS) * time.Hour)
-		} else {
-			logger.Error(fmt.Sprintf("Failed to cluster topics: %v", err))
-			logger.Info("Sleeping for 60 minutes before next attempt.")
-			time.Sleep(60 * time.Minute)
-		}
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "Server healthy")
+	})
+
+	http.HandleFunc("/control-clustering", func(w http.ResponseWriter, r *http.Request) {
+		topicsClustererRunning = r.URL.Query().Get("start") == "true"
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "Clustering status updated with start="+strconv.FormatBool(topicsClustererRunning))
+	})
+
+	logger.Info("HTTP server starting on :8080 (endpoints: /health, /control-clustering)")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		logger.Fatal(fmt.Sprintf("HTTP server stopped unexpectedly: %v", err))
 	}
 }
