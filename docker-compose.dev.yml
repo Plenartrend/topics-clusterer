@@ -1,0 +1,17 @@
+services:
+
+  server:
+    build:
+      dockerfile: dockerfile.dev
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./:/app/
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - plenartrend_network
+
+networks:
+  plenartrend_network:
+    name: plenartrend_network
