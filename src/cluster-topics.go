@@ -91,6 +91,8 @@ func clusterTopics(num_clusters int, num_closest_topics int, db *sqlx.DB, logger
 	}
 	defer tx.Rollback()
 
+	logger.Debug("Clearing and resetting topic_clusters table")
+
 	_, err = tx.Exec("DELETE FROM topic_clusters")
 	if err != nil {
 		return fmt.Errorf("failed to clear topic_clusters table: %w", err)
@@ -101,13 +103,15 @@ func clusterTopics(num_clusters int, num_closest_topics int, db *sqlx.DB, logger
 		return fmt.Errorf("failed to reset topic_clusters sequence: %w", err)
 	}
 
+	logger.Debug("Fetching topics from database")
+
 	var topics []Topic
 	err = tx.Select(&topics, "SELECT id, name, embedding FROM topics")
 	if err != nil {
 		return fmt.Errorf("failed to fetch topics: %w", err)
 	}
 
-	logger.Debug(fmt.Sprintf("Fetched %d topics from database\n", len(topics)))
+	logger.Debug(fmt.Sprintf("Fetched %d topics from database", len(topics)))
 
 	resultClusters, err := doClustering(topics, num_clusters)
 	if err != nil {
@@ -115,16 +119,18 @@ func clusterTopics(num_clusters int, num_closest_topics int, db *sqlx.DB, logger
 	}
 
 	for i, cluster := range resultClusters {
-		logger.Debug(fmt.Sprintf("\n=== Cluster %d (contains %d topics) ===\n", i, len(cluster.Observations)))
+		logger.Debug(fmt.Sprintf("=== Cluster %d (contains %d topics) ===", i, len(cluster.Observations)))
 
 		closestTopics := getClosestTopics(cluster, num_closest_topics)
+
+		logger.Debug(fmt.Sprintf("Found %d closest topics for cluster %d", len(closestTopics), i))
 
 		title, err := getClusterTitle(closestTopics, logger)
 		if err != nil {
 			return fmt.Errorf("failed to get cluster title: %w", err)
 		}
 
-		logger.Info(fmt.Sprintf("Cluster Title: %s", title))
+		logger.Debug("Inserting cluster into database")
 
 		var clusterId int
 		err = tx.Get(&clusterId, "INSERT INTO topic_clusters (title) VALUES ($1) RETURNING id", title)
@@ -138,12 +144,14 @@ func clusterTopics(num_clusters int, num_closest_topics int, db *sqlx.DB, logger
 			clusterTopicIds = append(clusterTopicIds, topicObs.TopicID)
 		}
 
+		logger.Debug(fmt.Sprintf("Assigning %d topics to cluster ID %d", len(clusterTopicIds), clusterId))
+
 		_, err = tx.Exec("UPDATE topics SET cluster_id = $1 WHERE id = ANY($2)", clusterId, pq.Array(clusterTopicIds))
 		if err != nil {
 			return fmt.Errorf("failed to update topics with cluster ID: %w", err)
 		}
 
-		logger.Info(fmt.Sprintf("Assigned %d topics to cluster ID %d", len(clusterTopicIds), clusterId))
+		logger.Info(fmt.Sprintf("Assigned %d topics to cluster %v (id: %d)", len(clusterTopicIds), title, clusterId))
 	}
 
 	err = tx.Commit()
