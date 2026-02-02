@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"google.golang.org/genai"
 )
@@ -23,6 +24,13 @@ Vorgaben:
 - Der Titel soll abstrakter sein als die Einzeltitel, aber kein Sammelverzeichnis und kein zu allgemeiner Begriff.
 - Keine neuen Inhalte oder politischen Konzepte einführen, die nicht in den Titeln angelegt sind.
 `
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
 
 func getClusterTitle(topicDistances []DataPointDistance, logger *Logger) (string, error) {
 	var closestTopicsString string
@@ -62,11 +70,28 @@ func getClusterTitle(topicDistances []DataPointDistance, logger *Logger) (string
 		ResponseMIMEType: "text/plain",
 	}
 
-	resp, err := geminiClient.Models.GenerateContent(context.Background(), GEMINI_MODEL, queryContent, contentConfig)
-	if err != nil {
-		return "", fmt.Errorf("failed to generate content: %w", err)
+	var resp *genai.GenerateContentResponse
+	var retriesLeft int = 3
+
+	for retriesLeft > 0 {
+		resp, err = geminiClient.Models.GenerateContent(context.Background(), GEMINI_MODEL, queryContent, contentConfig)
+		retriesLeft--
+
+		if err != nil {
+			logger.Warn(fmt.Sprintf("Failed to generate content from Gemini (trying %d more times): %v", retriesLeft, err))
+			continue
+		}
+
+		if strings.Trim(resp.Text(), " '\"") != "" && len(strings.Split(resp.Text(), " ")) <= 6 {
+			break
+		}
+
+		logger.Warn(fmt.Sprintf("Received empty or too long title from Gemini, retrying... (Title: '%s')", truncateString(resp.Text(), 50)))
 	}
 
-	title := resp.Text()
-	return title, nil
+	if retriesLeft == 0 {
+		return "", fmt.Errorf("failed to generate a valid title from Gemini after multiple attempts: %w", err)
+	}
+
+	return strings.Trim(resp.Text(), " '\""), nil
 }
