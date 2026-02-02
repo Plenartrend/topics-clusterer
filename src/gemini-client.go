@@ -21,8 +21,8 @@ Gib nur den übergeordneten Thementitel zurück, ohne weitere Erklärungen oder 
 
 Vorgaben:
 - Verwende eine kurze nominale Wortgruppe (1-6 Wörter).
-- Der Titel soll abstrakter sein als die Einzeltitel, aber kein Sammelverzeichnis und kein zu allgemeiner Begriff.
-- Keine neuen Inhalte oder politischen Konzepte einführen, die nicht in den Titeln angelegt sind.
+- Der Thementitel soll abstrakter sein als die Einzeltitel, aber kein Sammelverzeichnis und kein zu allgemeiner Begriff.
+- Führe keine neuen Inhalte oder politischen Konzepte ein, die nicht in den Titeln angelegt sind.
 `
 
 func truncateString(s string, maxLen int) string {
@@ -32,13 +32,13 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-func getClusterTitle(topicDistances []DataPointDistance, logger *Logger) (string, error) {
+func getClusterTitle(topicDistances []DataPointDistance, previousTitlesStr string, logger *Logger) (string, error) {
 	var closestTopicsString string
 	for _, td := range topicDistances {
 		closestTopicsString = closestTopicsString + fmt.Sprintf("- %v (%.4f)\n", td.DataPoint.(TopicDataPoint).TopicName, td.Distance)
 	}
 
-	logger.Debug(closestTopicsString)
+	logger.Debug(fmt.Sprintf("Closest topics:\n%v", closestTopicsString))
 
 	geminiClient, err := genai.NewClient(context.Background(), &genai.ClientConfig{
 		APIKey:  os.Getenv("GEMINI_API_KEY"),
@@ -48,11 +48,21 @@ func getClusterTitle(topicDistances []DataPointDistance, logger *Logger) (string
 		return "", fmt.Errorf("failed to create Gemini client: %w", err)
 	}
 
+	if previousTitlesStr == "" {
+		previousTitlesStr = "(keine vorherigen Thementitel vorhanden)"
+	}
+
 	queryContent := []*genai.Content{
 		{
 			Parts: []*genai.Part{
 				{
-					Text: "The topics are as follows:",
+					Text: "Hier sind einige Thementitel von vorherigen Themenclustern. Verwende sie, um Überschneidungen zu vermeiden:",
+				},
+				{
+					Text: previousTitlesStr,
+				},
+				{
+					Text: "Die Themen, zu denen du einen passenden Thementitel finden sollst, lauten wie folgt:",
 				},
 				{
 					Text: closestTopicsString,

@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"sort"
+	"strings"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
@@ -12,9 +14,15 @@ import (
 )
 
 type Topic struct {
-	ID        int             `db:"id" json:"id,omitempty"`
-	Name      string          `db:"name" json:"name,omitempty"`
-	Embedding pgvector.Vector `db:"embedding" json:"embedding,omitempty"`
+	ID        int              `db:"id" json:"id,omitempty"`
+	Name      string           `db:"name" json:"name,omitempty"`
+	Embedding *pgvector.Vector `db:"embedding" json:"embedding,omitempty"`
+}
+
+type TopicCluster struct {
+	ID        int              `db:"id" json:"id,omitempty"`
+	Title     string           `db:"title" json:"title,omitempty"`
+	Embedding *pgvector.Vector `db:"embedding" json:"embedding,omitempty"`
 }
 
 type TopicDataPoint struct {
@@ -27,7 +35,24 @@ func (tdp TopicDataPoint) Coordinates() Coordinates {
 	return tdp.coords
 }
 
-func toCoordinates(coordinates []float32) Coordinates {
+type TopicClusterDataPoint struct {
+	ClusterID    int
+	ClusterTitle string
+	coords       Coordinates
+}
+
+type OldClusterDataPoint struct {
+	Title       string
+	Coordinates Coordinates
+}
+
+type OldClusterData struct {
+	DataPoints []OldClusterDataPoint
+	TitlesStr  string
+}
+
+func toCoordinates(vector *pgvector.Vector) Coordinates {
+	coordinates := vector.Slice()
 	coords := make(Coordinates, len(coordinates))
 	for i, v := range coordinates {
 		coords[i] = float64(v)
@@ -35,17 +60,53 @@ func toCoordinates(coordinates []float32) Coordinates {
 	return coords
 }
 
-func doClustering(topics []Topic, numClusters int) ([]Cluster, error) {
+func toPGVector(coords *Coordinates) pgvector.Vector {
+	floatSlice := make([]float32, len(*coords))
+	for i, v := range *coords {
+		floatSlice[i] = float32(v)
+	}
+	return pgvector.NewVector(floatSlice)
+}
+
+func doClustering(oldClusters []TopicCluster, topics []Topic, numClusters int, logger *Logger) ([]Cluster, error) {
 	topicDataPoints := make([]DataPoint, len(topics))
 	for i, topic := range topics {
+		if topic.Embedding == nil {
+			return nil, fmt.Errorf("topic ID %d has nil embedding", topic.ID)
+		}
+
 		topicDataPoints[i] = TopicDataPoint{
 			TopicID:   topic.ID,
 			TopicName: topic.Name,
-			coords:    toCoordinates(topic.Embedding.Slice()),
+			coords:    toCoordinates(topic.Embedding),
 		}
 	}
 
-	centroids := kmeanspp(numClusters, topicDataPoints, rand.New(rand.NewSource(42)))
+	var centroids []Coordinates
+	ok := len(oldClusters) == numClusters
+
+	if ok {
+		for _, cluster := range oldClusters {
+			if cluster.Embedding == nil {
+				ok = false
+				break
+			}
+		}
+	}
+
+	if ok {
+		logger.Debug("Using previous cluster centroids as initial centroids")
+
+		centroids = make([]Coordinates, numClusters)
+		for i, cluster := range oldClusters {
+			centroids[i] = toCoordinates(cluster.Embedding)
+		}
+	} else {
+		logger.Debug("Cannot reuse previous cluster centroids due to nil embeddings or size mismatch; initializing new centroids using k-means++")
+
+		centroids = kmeanspp(numClusters, topicDataPoints, rand.New(rand.NewSource(42)))
+	}
+
 	clusters := kmeans_deterministic(numClusters, topicDataPoints, centroids, 200, rand.New(rand.NewSource(42)))
 
 	return clusters, nil
@@ -64,12 +125,59 @@ func getClosestTopics(cluster Cluster, n int) []DataPointDistance {
 	return distances[:int(math.Min(float64(n), float64(len(distances))))]
 }
 
+func getOldClusterData(oldClusters []TopicCluster) OldClusterData {
+	var dataPoints []OldClusterDataPoint
+	var titles []string
+
+	for _, cluster := range oldClusters {
+		if cluster.Embedding != nil {
+			dataPoints = append(dataPoints, OldClusterDataPoint{
+				Title:       cluster.Title,
+				Coordinates: toCoordinates(cluster.Embedding),
+			})
+		}
+		titles = append(titles, cluster.Title)
+	}
+
+	titlesStr := strings.Join(titles, ", ")
+
+	return OldClusterData{
+		DataPoints: dataPoints,
+		TitlesStr:  titlesStr,
+	}
+}
+
+func decideClusterTitle(cluster Cluster, closestTopics []DataPointDistance, oldClusterData OldClusterData, logger *Logger) (string, error) {
+	for _, previousDataPoint := range oldClusterData.DataPoints {
+		if distance(cluster.Centroid, previousDataPoint.Coordinates) < 0.01 {
+			logger.Debug("Reusing title from previous topic clusters: " + previousDataPoint.Title)
+			return previousDataPoint.Title, nil
+		}
+	}
+
+	title, err := getClusterTitle(closestTopics, oldClusterData.TitlesStr, logger)
+	if err != nil {
+		return "", fmt.Errorf("failed to get cluster title: %w", err)
+	}
+	return title, nil
+}
+
 func clusterTopics(num_clusters int, num_closest_topics int, db *sqlx.DB, logger *Logger) error {
 	tx, err := db.Beginx()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
+
+	logger.Debug("Retrieving previous topic clusters from database")
+
+	var previousTopicClusters []TopicCluster
+	err = tx.Select(&previousTopicClusters, "SELECT id, title, embedding FROM topic_clusters")
+	if err != nil {
+		return fmt.Errorf("failed to fetch existing topic clusters: %w", err)
+	}
+
+	oldClusterData := getOldClusterData(previousTopicClusters)
 
 	logger.Debug("Clearing and resetting topic_clusters table")
 
@@ -91,9 +199,14 @@ func clusterTopics(num_clusters int, num_closest_topics int, db *sqlx.DB, logger
 		return fmt.Errorf("failed to fetch topics: %w", err)
 	}
 
+	// Sort for stability
+	slices.SortFunc(topics, func(a, b Topic) int {
+		return a.ID - b.ID
+	})
+
 	logger.Debug(fmt.Sprintf("Fetched %d topics from database", len(topics)))
 
-	resultClusters, err := doClustering(topics, num_clusters)
+	resultClusters, err := doClustering(previousTopicClusters, topics, num_clusters, logger)
 	if err != nil {
 		return fmt.Errorf("clustering failed: %w", err)
 	}
@@ -105,15 +218,15 @@ func clusterTopics(num_clusters int, num_closest_topics int, db *sqlx.DB, logger
 
 		logger.Debug(fmt.Sprintf("Found %d closest topics for cluster %d", len(closestTopics), i))
 
-		title, err := getClusterTitle(closestTopics, logger)
+		title, err := decideClusterTitle(cluster, closestTopics, oldClusterData, logger)
 		if err != nil {
-			return fmt.Errorf("failed to get cluster title: %w", err)
+			return fmt.Errorf("failed to decide cluster title: %w", err)
 		}
 
 		logger.Debug("Inserting cluster into database")
 
 		var clusterId int
-		err = tx.Get(&clusterId, "INSERT INTO topic_clusters (title) VALUES ($1) RETURNING id", title)
+		err = tx.Get(&clusterId, "INSERT INTO topic_clusters (title, embedding) VALUES ($1, $2) RETURNING id", title, toPGVector(&cluster.Centroid))
 		if err != nil {
 			return fmt.Errorf("failed to insert topic cluster: %w", err)
 		}
