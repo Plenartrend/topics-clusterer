@@ -113,6 +113,27 @@ func heartbeatWorker(db *sqlx.DB, logger *Logger) {
 	}
 }
 
+func attemptStartTopicClustering(db *sqlx.DB, logger *Logger, NUM_CLUSTERS int, NUM_CLOSEST_TOPICS int, TOPIC_CLUSTERING_SLEEP_HOURS int) {
+	for {
+		acquired, err := tryAcquireTopicClusterLock(db, logger)
+		if err != nil {
+			logger.Fatal(fmt.Sprintf("Failed to try to acquire topic cluster lock: %v", err))
+		}
+
+		if acquired {
+			break
+		}
+
+		time.Sleep(1 * time.Minute)
+	}
+
+	logger.Info("Topic cluster lock acquired successfully.")
+
+	go heartbeatWorker(db, logger)
+
+	topicClustererWorker(NUM_CLUSTERS, NUM_CLOSEST_TOPICS, TOPIC_CLUSTERING_SLEEP_HOURS, db, logger)
+}
+
 func main() {
 	_ = godotenv.Load()
 
@@ -171,24 +192,7 @@ func main() {
 		return
 	}
 
-	for {
-		acquired, err := tryAcquireTopicClusterLock(db, logger)
-		if err != nil {
-			logger.Fatal(fmt.Sprintf("Failed to try to acquire topic cluster lock: %v", err))
-		}
-
-		if acquired {
-			break
-		}
-
-		time.Sleep(1 * time.Minute)
-	}
-
-	logger.Info("Topic cluster lock acquired successfully.")
-
-	go heartbeatWorker(db, logger)
-
-	go topicClustererWorker(NUM_CLUSTERS, NUM_CLOSEST_TOPICS, TOPIC_CLUSTERING_SLEEP_HOURS, db, logger)
+	go attemptStartTopicClustering(db, logger, NUM_CLUSTERS, NUM_CLOSEST_TOPICS, TOPIC_CLUSTERING_SLEEP_HOURS)
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
