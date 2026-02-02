@@ -6,8 +6,6 @@ require (
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/joho/godotenv v1.5.1
 	github.com/lib/pq v1.11.1
-	github.com/muesli/clusters v0.0.0-20200529215643-2700303c1762
-	github.com/muesli/kmeans v0.3.1
 	github.com/pgvector/pgvector-go v0.3.0
 	google.golang.org/genai v1.44.0
 )
